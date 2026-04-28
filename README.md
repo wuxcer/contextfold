@@ -102,8 +102,8 @@ Every turn has a stable ID mapped to line ranges in the session JSONL. Call `con
 ### From source
 
 ```bash
-git clone https://github.com/anthropics/openclaw-contextfold.git
-cd openclaw-contextfold
+git clone https://github.com/wuxcer/contextfold
+cd contextfold
 npm install
 npm run build
 ```
@@ -126,7 +126,7 @@ Add to `openclaw.json`:
     },
     "allow": ["context-manager"],
     "load": {
-      "paths": ["/path/to/openclaw-contextfold"]
+      "paths": ["/path/to/contextfold"]
     }
   }
 }
