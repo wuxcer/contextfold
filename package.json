@@ -1,0 +1,62 @@
+{
+  "name": "@openclaw/contextfold",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "ContextFold — topic-aware context folding plugin for OpenClaw. Detects conversation topics, compresses losslessly, recovers on demand.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "lint": "eslint src/",
+    "test": "node --test dist/**/*.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "openclaw": {
+    "extensions": ["./dist/index.js"],
+    "compat": {
+      "pluginApi": ">=2026.3.24-beta.2",
+      "minGatewayVersion": "2026.3.24-beta.2"
+    },
+    "build": {
+      "openclawVersion": "2026.3.24-beta.2",
+      "pluginSdkVersion": "2026.3.24-beta.2"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/anthropics/openclaw-contextfold.git"
+  },
+  "homepage": "https://github.com/anthropics/openclaw-contextfold#readme",
+  "bugs": {
+    "url": "https://github.com/anthropics/openclaw-contextfold/issues"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "contextfold",
+    "context",
+    "context-window",
+    "token-optimization",
+    "topic-segmentation",
+    "lossless-compression",
+    "summarize",
+    "llm",
+    "ai-agent"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "@sinclair/typebox": "^0.34.0"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "id": "context-manager",
+  "name": "ContextFold",
+  "description": "Topic-aware context folding for OpenClaw agents — detect topics, fold losslessly, unfold on demand",
+  "version": "1.0.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "maxTokens": {
+        "type": "number",
+        "description": "Maximum token budget for context window (default: 128000)"
+      },
+      "summaryModel": {
+        "type": "string",
+        "description": "Model to use for context summarization (defaults to current agent model)"
+      },
+      "autoSummarize": {
+        "type": "boolean",
+        "description": "Automatically summarize when context exceeds threshold (default: true)"
+      },
+      "summarizeThreshold": {
+        "type": "number",
+        "description": "Token percentage threshold to trigger auto-summarization (0-1, default: 0.8)"
+      },
+      "preserveSystemMessages": {
+        "type": "boolean",
+        "description": "Always preserve system messages during pruning (default: true)"
+      },
+      "preserveRecentMessages": {
+        "type": "number",
+        "description": "Number of recent messages to always keep (default: 10)"
+      }
+    }
+  },
+  "uiHints": {
+    "maxTokens": {
+      "label": "Max Context Tokens",
+      "placeholder": "128000",
+      "help": "Maximum token budget for the context window"
+    },
+    "summaryModel": {
+      "label": "Summary Model",
+      "placeholder": "Leave empty to use current model",
+      "help": "Model ID for generating context summaries"
+    },
+    "autoSummarize": {
+      "label": "Auto Summarize",
+      "help": "Automatically summarize old messages when context grows too large"
+    },
+    "summarizeThreshold": {
+      "label": "Summarize Threshold",
+      "placeholder": "0.8",
+      "help": "Trigger summarization when context reaches this fraction of max tokens"
+    },
+    "preserveRecentMessages": {
+      "label": "Preserve Recent Messages",
+      "placeholder": "10",
+      "help": "Always keep the N most recent messages intact"
+    }
+  }
+}
