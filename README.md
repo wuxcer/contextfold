@@ -144,7 +144,7 @@ Add to `openclaw.json`:
     },
     "allow": ["context-manager"],
     "load": {
-      "paths": ["/path/to/openclaw-contextfold"]
+      "paths": ["/path/to/contextfold"]
     }
   }
 }
