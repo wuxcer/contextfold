@@ -25,6 +25,21 @@ export interface AdapterOptions {
   logger?: { info(msg: string): void; warn(msg: string): void; error(msg: string): void };
 }
 
+/**
+ * Ensure message content is always an array (OpenClaw runtime expects ContentPart[]).
+ * Handles string, null, undefined, and already-array cases.
+ */
+function ensureArrayContent(msg: any): any {
+  if (!msg) return msg;
+  if (typeof msg.content === "string") {
+    return { ...msg, content: [{ type: "text", text: msg.content }] };
+  }
+  if (!msg.content || !Array.isArray(msg.content)) {
+    return { ...msg, content: [{ type: "text", text: "" }] };
+  }
+  return msg;
+}
+
 export function createContextEngineAdapter(
   options: AdapterOptions = {},
 ) {
@@ -62,7 +77,36 @@ export function createContextEngineAdapter(
       };
     },
 
-    async ingest(_params: { sessionId: string; sessionKey?: string; message: any; isHeartbeat?: boolean }) {
+    async ingest(params: { sessionId: string; sessionKey?: string; message: any; isHeartbeat?: boolean }) {
+      const { sessionId, message } = params;
+
+      // 当收到 assistant 消息时，一轮对话结束
+      // 异步更新索引并触发子话题检测
+      if (message?.role === "assistant") {
+        const file = sessionFiles.get(sessionId);
+        if (file) {
+          // 异步执行，不阻塞 ingest 返回
+          (async () => {
+            try {
+              // 增量更新索引
+              const existingIndex = await loadIndex(file);
+              const updatedIndex = await buildSessionIndex(file, existingIndex ?? undefined);
+              await saveIndex(file, updatedIndex);
+
+              // 获取最新的 turn 并触发子话题检测
+              const lastTurn = updatedIndex.turns[updatedIndex.turns.length - 1];
+              if (lastTurn) {
+                engine.onTurnComplete(file, lastTurn);
+              }
+            } catch (err) {
+              options.logger?.error(
+                `[ingest] async index update failed: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          })();
+        }
+      }
+
       return { ingested: true };
     },
 
@@ -70,7 +114,7 @@ export function createContextEngineAdapter(
       const file = params.sessionFile ?? sessionFiles.get(params.sessionId);
       if (!file) {
         return {
-          messages: params.messages,
+          messages: params.messages.map(ensureArrayContent),
           estimatedTokens: 0,
         };
       }
@@ -81,8 +125,10 @@ export function createContextEngineAdapter(
 
       const result = await engine.assemble(file, params.messages);
 
+      // Double-ensure all messages have array content — OpenClaw runtime
+      // calls .content.flatMap() and will crash if content is a string
       return {
-        messages: result.messages as any[],
+        messages: (result.messages as any[]).map(ensureArrayContent),
         estimatedTokens: result.tokenCount,
       };
     },

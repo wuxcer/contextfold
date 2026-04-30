@@ -4,6 +4,9 @@
 
 Detect topic boundaries → fold old conversations → keep what matters → unfold on demand.
 
+[![npm](https://img.shields.io/npm/v/@openclaw/contextfold)](https://www.npmjs.com/package/@openclaw/contextfold)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+
 ```
  30 turns · 50K tokens                    What the model sees
 ┌──────────────────────┐          ┌──────────────────────────────┐
@@ -24,7 +27,7 @@ Detect topic boundaries → fold old conversations → keep what matters → unf
 
 ## How It Works
 
-### Three-Level Compression Pipeline
+### Four-Phase Compression Pipeline
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -42,6 +45,10 @@ Detect topic boundaries → fold old conversations → keep what matters → unf
 │    Over budget?                                                          │
 │    ├─ Step 1: head+tail truncate large tool results → cache (0 cost)     │
 │    └─ Step 2: still over? → async LLM compress top-3 largest turns       │
+│                                                                          │
+│  Phase 4 — Content normalization:                                        │
+│    └─ Ensure all message content is ContentPart[] (array format)         │
+│       Required by OpenClaw Pi runtime                                    │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -50,6 +57,7 @@ Detect topic boundaries → fold old conversations → keep what matters → unf
 | Drop irrelevant topics | topic/subtopic match | 0 | Entire turn removed |
 | Tool result truncation | head+tail algorithm | 0 | Large results → 40K chars |
 | LLM summarization | async, top-N largest | $$$ | Entire turn → ~50 tokens |
+| Content normalization | string → ContentPart[] | 0 | Runtime compatibility |
 
 ### Two-Layer Topic Detection
 
@@ -57,11 +65,20 @@ Detect topic boundaries → fold old conversations → keep what matters → unf
 — Cosine similarity between adjacent turns finds major topic shifts (weather → coding → dinner)
 — Pure local computation, no API calls
 
-**Layer 2: Per-turn lightweight LLM classification** (async, after each turn completes)
+**Layer 2: Per-turn lightweight LLM classification** (async, triggered via `ingest()` lifecycle)
+— Triggered automatically when an assistant message is ingested (turn complete)
 — Input: ~100-200 tokens (userPreview + assistantPreview + tool names only)
 — Output: `{"subtopic": "<label>", "isNewSubtopic": bool}` (~30-50 tokens)
 — Result stored in `TurnIndex.subtopicId` for direct O(1) lookup
 — Never blocks assemble or compact
+
+### Ingest Lifecycle
+
+The adapter hooks into OpenClaw’s `ingest()` callback. When an assistant message arrives (signaling turn completion):
+
+1. **Async index update** — incrementally rebuilds the session index
+2. **Subtopic classification** — calls `onTurnComplete()` to classify the latest turn
+3. **Non-blocking** — all work runs asynchronously without blocking message flow
 
 ### Folding Strategy
 
@@ -120,8 +137,8 @@ Every turn has a stable ID mapped to line ranges in the session JSONL. Call `con
 ### From source
 
 ```bash
-git clone https://github.com/wuxcer/contextfold.git
-cd contextfold
+git clone https://github.com/wuxcer/openclaw-contextfold.git
+cd openclaw-contextfold
 npm install
 npm run build
 ```
@@ -144,7 +161,7 @@ Add to `openclaw.json`:
     },
     "allow": ["context-manager"],
     "load": {
-      "paths": ["/path/to/contextfold"]
+      "paths": ["/path/to/openclaw-contextfold"]
     }
   }
 }
@@ -192,7 +209,9 @@ src/
 │
 ├── engine/
 │   ├── context-engine.ts             # Core: assemble() + compact() + topic classification
+│   │                                 #   + normalizeMessageContent (Phase 4)
 │   ├── adapter.ts                    # OpenClaw ContextEngine interface adapter
+│   │                                 #   + ingest() lifecycle (async index + subtopic)
 │   ├── summary-cache.ts             # Disk-persisted LLM summaries
 │   ├── tool-result-cache.ts         # Disk-persisted head+tail truncated tool results
 │   └── index.ts
@@ -227,10 +246,11 @@ src/
 
 - **Append-only transcripts** — session JSONL is never modified. Summaries live in side caches. Full recovery is always possible.
 - **Incremental pre-compression** — every assemble checks budget and compresses incrementally (drop → truncate → summarize), never waits for a big-bang compaction.
-- **Per-turn topic classification** — lightweight async LLM call (~200 tokens) after each turn, results cached in index.
+- **Per-turn topic classification** — lightweight async LLM call (~200 tokens) triggered by ingest lifecycle, results cached in index.
 - **KV cache stability** — once content is compressed (truncated/summarized), it stays stable. No oscillation between assembles.
 - **Graceful degradation** — no LLM available? Falls back to local heuristic extraction.
 - **Turn-based, not message-based** — a turn (user → assistant round-trip) is the natural compression unit.
+- **Runtime compatibility** — output normalized to ContentPart[] format for OpenClaw Pi runtime.
 
 ---
 
@@ -292,6 +312,18 @@ npm run lint      # Lint
 - **OpenClaw** ≥ 2026.3.24-beta.2
 - **Node.js** ≥ 20
 - **TypeScript** ≥ 5.7 (development)
+
+## Changelog
+
+See [git log](https://github.com/wuxcer/openclaw-contextfold) for full history.
+
+### Recent
+
+- **Phase 4: Content normalization** — all assembled messages now have `content` as `ContentPart[]` for OpenClaw Pi runtime compatibility
+- **Ingest lifecycle** — adapter now hooks `ingest()` to trigger async index updates and subtopic detection on turn completion
+- **Per-turn subtopicId** — stored directly in `TurnIndex` for O(1) lookup during assemble
+- **Selective LLM compaction** — only top-N largest turns are compressed per cycle
+- **Tool result head+tail truncation** — large tool results cached with 40K char limit (zero-cost)
 
 ## License
 

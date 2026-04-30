@@ -221,7 +221,7 @@ export class TurnIndexedContextEngine {
 
     if (turns.length === 0) {
       return {
-        messages: allMessages,
+        messages: allMessages.map((msg) => normalizeMessageContent(msg)),
         tokenCount: estimateMessagesTokens(allMessages),
       };
     }
@@ -414,8 +414,14 @@ export class TurnIndexedContextEngine {
       }
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    // Phase 4: Normalize — 确保所有 message 的 content 为 array 格式
+    //   OpenClaw Pi 运行时期望 content 为 ContentPart[] 而非 string
+    // ══════════════════════════════════════════════════════════════════
+    const normalized = result.map((msg) => normalizeMessageContent(msg));
+
     return {
-      messages: result,
+      messages: normalized,
       tokenCount: usedTokens,
     };
   }
@@ -1099,6 +1105,21 @@ function buildCompactInput(turn: TurnIndex, rawLines: string[], toolResultCache?
   }
 
   return parts.join("\n");
+}
+
+/**
+ * Normalize message content to array format.
+ * OpenClaw Pi runtime expects content to be ContentPart[] (array), not string.
+ * This ensures all messages returned from assemble have array-format content.
+ */
+function normalizeMessageContent(msg: EngineMessage): EngineMessage {
+  if (typeof msg.content === "string") {
+    return { ...msg, content: [{ type: "text", text: msg.content }] };
+  }
+  if (!msg.content) {
+    return { ...msg, content: [{ type: "text", text: "" }] };
+  }
+  return msg;
 }
 
 function extractText(content: unknown): string {
