@@ -66,6 +66,15 @@ export interface TurnIndex {
   toolCallCount: number;
   /** 本轮总 token 估算 */
   totalTokens: number;
+  /** 本轮各角色 token 细分（旧索引可能不存在） */
+  tokenBreakdown?: {
+    /** 用户输入 token */
+    user: number;
+    /** 助手输出 token（含文本回复 + toolCall 定义） */
+    assistant: number;
+    /** 工具调用结果 token */
+    toolResult: number;
+  };
   /** 本轮 user 消息的文本预览（前 200 字符） */
   userPreview: string;
   /** 本轮 assistant 最终回复的文本预览（前 200 字符） */
@@ -75,6 +84,10 @@ export interface TurnIndex {
   endTime: string;
   /** 所属 Topic ID */
   topicId: string;
+  /** 所属 Sub-topic ID（轻量 LLM 分类后回填，可能为空） */
+  subtopicId?: string;
+  /** Sub-topic 标签 */
+  subtopicLabel?: string;
   /** 本轮是否包含工具调用出错 */
   hasError: boolean;
   /**

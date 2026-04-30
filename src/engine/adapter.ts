@@ -10,6 +10,7 @@ import { TurnIndexedContextEngine, type EngineConfig, type SummarizeFn } from ".
 import { buildSessionIndex } from "../session-index/builder.js";
 import { loadIndex, saveIndex } from "../session-index/persistence.js";
 import { loadSummaryCache, getCacheStats } from "./summary-cache.js";
+import { loadToolResultCache, getToolResultCacheStats } from "./tool-result-cache.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Adapter
@@ -20,6 +21,8 @@ export interface AdapterOptions {
   config?: Partial<EngineConfig>;
   /** LLM 摘要函数（由 plugin register 阶段注入） */
   summarize?: SummarizeFn;
+  /** 可选 logger */
+  logger?: { info(msg: string): void; warn(msg: string): void; error(msg: string): void };
 }
 
 export function createContextEngineAdapter(
@@ -28,6 +31,7 @@ export function createContextEngineAdapter(
   const engine = new TurnIndexedContextEngine({
     ...options.config,
     summarize: options.summarize,
+    logger: options.logger,
   });
 
   const sessionFiles = new Map<string, string>();
@@ -113,6 +117,8 @@ export function createContextEngineAdapter(
 
       const cache = await loadSummaryCache(file);
       const cacheStats = getCacheStats(cache);
+      const trCache = await loadToolResultCache(file);
+      const trCacheStats = getToolResultCacheStats(trCache);
 
       return {
         ok: true,
@@ -126,6 +132,8 @@ export function createContextEngineAdapter(
             tokensSaved: result.tokensSaved,
             llmCalls: result.llmCalls,
             cacheHits: result.cacheHits,
+            toolResultTruncations: trCacheStats.totalEntries,
+            toolResultTokensSaved: trCacheStats.totalTokensSaved,
           },
         },
       };

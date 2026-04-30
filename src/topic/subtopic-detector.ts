@@ -44,6 +44,13 @@ export interface SubTopicResult {
 /** LLM 分类函数 */
 export type LlmClassifyFn = (input: string, context: string) => Promise<string>;
 
+/** 可选 logger 接口 */
+export interface SubTopicLogger {
+  info(msg: string): void;
+  warn(msg: string): void;
+  error(msg: string): void;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  LLM 子话题检测
 // ═══════════════════════════════════════════════════════════════════════════
@@ -152,9 +159,10 @@ export async function detectSubTopicsByLlm(
   topicId: string,
   turns: TurnIndex[],
   llmClassify: LlmClassifyFn,
+  logger?: SubTopicLogger,
 ): Promise<SubTopicResult> {
   if (turns.length <= 2) {
-    // 太少的 turn，直接归为一个子话题
+    logger?.info(`[subtopic] topic=${topicId}: skipping LLM (only ${turns.length} turns, need >2)`);
     return {
       topicId,
       subtopics: [{
@@ -171,11 +179,16 @@ export async function detectSubTopicsByLlm(
   const prompt = buildSubTopicPrompt(turns);
   const context = `Detecting sub-topics within topic ${topicId} (${turns.length} turns)`;
 
+  logger?.info(`[subtopic] topic=${topicId}: calling LLM for ${turns.length} turns`);
+
   try {
     const llmOutput = await llmClassify(prompt, context);
+    logger?.info(`[subtopic] topic=${topicId}: LLM returned ${llmOutput.length} chars`);
+
     const subtopics = parseLlmSubTopicResult(llmOutput, turns);
 
     if (subtopics && subtopics.length > 0) {
+      logger?.info(`[subtopic] topic=${topicId}: LLM detected ${subtopics.length} sub-topics: ${subtopics.map(s => s.label).join(' | ')}`);
       return {
         topicId,
         subtopics,
@@ -183,10 +196,14 @@ export async function detectSubTopicsByLlm(
         createdAt: new Date().toISOString(),
       };
     }
-  } catch {
-    // LLM 调用失败，回退到启发式
+
+    logger?.warn(`[subtopic] topic=${topicId}: LLM parse returned null/empty, falling back to heuristic. Raw output: ${llmOutput.slice(0, 200)}`);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger?.error(`[subtopic] topic=${topicId}: LLM call failed: ${errMsg}`);
   }
 
+  logger?.info(`[subtopic] topic=${topicId}: using heuristic fallback`);
   // 回退到启发式检测
   return detectSubTopicsByHeuristic(topicId, turns);
 }

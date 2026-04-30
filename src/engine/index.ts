@@ -15,3 +15,14 @@ export {
   type SummaryCache,
   type CachedSummary,
 } from "./summary-cache.js";
+export {
+  loadToolResultCache,
+  saveToolResultCache,
+  getCachedToolResult,
+  setCachedToolResult,
+  truncateHeadTail,
+  getToolResultCacheStats,
+  type ToolResultCache,
+  type CachedToolResult,
+  type TurnToolResultCache,
+} from "./tool-result-cache.js";

@@ -13,7 +13,7 @@
  * "记忆缺失"问题通过摘要 + 按需恢复解决。
  */
 
-import type { TurnIndex, SessionIndex } from "../session-index/types.js";
+import type { TurnIndex, SessionIndex, TopicIndex } from "../session-index/types.js";
 import { buildSessionIndex } from "../session-index/builder.js";
 import { SessionIndexQuery } from "../session-index/query.js";
 import { saveIndex, loadIndex, isIndexStale } from "../session-index/persistence.js";
@@ -28,10 +28,15 @@ import {
   type CachedSummary,
 } from "./summary-cache.js";
 import {
-  detectSubTopicsByLlm,
-  detectSubTopicsByHeuristic,
+  loadToolResultCache,
+  saveToolResultCache,
+  getCachedToolResult,
+  setCachedToolResult,
+  truncateHeadTail,
+  type ToolResultCache,
+} from "./tool-result-cache.js";
+import {
   type SubTopicResult,
-  type SubTopic,
 } from "../topic/subtopic-detector.js";
 import {
   loadSubTopicCache,
@@ -95,6 +100,14 @@ export interface EngineConfig {
   /** 单个 tool result 的最大 token 数，超过就截断（头尾保留，中间省略） */
   toolResultMaxTokens: number;
   /**
+   * 非保护区 turn 中单个 tool result 的最大字符数。
+   * 超过此阈值时，在 assemble 阶段进行 head+tail 算法截断并缓存。
+   * 默认值：40000 字符（与 OpenClaw 核心的 DEFAULT_MAX_LIVE_TOOL_RESULT_CHARS 一致）
+   */
+  toolResultTruncateChars: number;
+  /** 每次异步 LLM 压缩最多处理的 turn 数量（按 token 数降序挑选） */
+  maxCompactionsPerCycle: number;
+  /**
    * LLM 摘要函数。
    *
    * 提供时：优先用 LLM 生成摘要（质量高）
@@ -120,6 +133,8 @@ export interface EngineConfig {
    * 开启后 assemble/compact 会感知话题边界。默认 true。
    */
   topicAwareEnabled: boolean;
+  /** 可选 logger，用于调试 */
+  logger?: { info(msg: string): void; warn(msg: string): void; error(msg: string): void };
 }
 
 const DEFAULT_ENGINE_CONFIG: EngineConfig = {
@@ -128,6 +143,8 @@ const DEFAULT_ENGINE_CONFIG: EngineConfig = {
   compactionThreshold: 0.75,
   systemPromptReserve: 10_000,
   toolResultMaxTokens: 500,
+  toolResultTruncateChars: 40_000,
+  maxCompactionsPerCycle: 3,
   crossTopicStrategy: "summarize",
   sameTopicMaxTurns: 3,
   topicAwareEnabled: true,
@@ -143,6 +160,11 @@ export class TurnIndexedContextEngine {
   private indexCache = new Map<string, { index: SessionIndex; query: SessionIndexQuery }>();
   /** 子话题检测缓存：topicId → SubTopicResult */
   private subtopicCache = new Map<string, SubTopicResult>();
+  private subtopicCacheLoaded = false;
+  /** tool result 截断缓存（内存副本，底层持久化到磁盘） */
+  private toolResultCacheMap = new Map<string, ToolResultCache>();
+  /** 异步压缩任务键记录，避免重复触发 */
+  private pendingCompactions = new Set<string>();
 
   constructor(config: Partial<EngineConfig> = {}) {
     this.config = { ...DEFAULT_ENGINE_CONFIG, ...config };
@@ -212,146 +234,91 @@ export class TurnIndexedContextEngine {
     const result: EngineMessage[] = [];
     let usedTokens = 0;
 
-    // ── 获取 topic 信息 ──────────────────────────────────────────────
+
+    // 加载 tool result 缓存
+    const toolResultCache = await this.getToolResultCache(sessionFile);
+    let toolResultCacheDirty = false;
+
+    // ── 话题相关性检测 ────────────────────────────────────────────
     const topics = query.getActiveTopics();
     const allTopics = query.getAllTopics ? query.getAllTopics() : topics;
-    const useTopicAware =
-      this.config.topicAwareEnabled && allTopics.length > 1;
-
-    // 当前话题 = 最后一个 Turn 所属的 topic
     const currentTopicId = turns[turns.length - 1]?.topicId;
 
-    // Phase 1: 构建历史摘要
-    if (useTopicAware) {
-      // ── Topic-aware 模式 ───────────────────────────────────────────
-      const historySections: string[] = [];
+    // 子话题信息：从缓存读取（不在 assemble 中触发检测，检测在 turn 完成时异步发起）
+    await this.loadSubTopicCacheIfNeeded(sessionFile);
 
-      // 按 topic 分组旧 Turn（recentCutoff 之前的）
-      const oldTurns = turns.slice(0, recentCutoff);
-      const topicGroups = groupTurnsByTopic(oldTurns);
+    const currentSubtopicId = this.getCurrentSubtopicId(currentTopicId);
 
-      for (const [topicId, groupTurns] of topicGroups) {
-        const topic = allTopics.find((t) => t.id === topicId);
-        const topicLabel = topic?.label ?? "unknown";
-        const isSameTopic = topicId === currentTopicId;
+    // ══════════════════════════════════════════════════════════════════
+    // Phase 1: 非保护区 turn
+    //   - 不相关的话题/子话题 → 直接丢弃（不进 prompt）
+    //   - 相关 + 有 LLM 摘要 → 用摘要
+    //   - 相关 + 无摘要 → 用原始消息（tool result 用 cache 截断版本）
+    // ══════════════════════════════════════════════════════════════════
+    let droppedTurns = 0;
 
-        if (isSameTopic) {
-          // 同话题的旧 Turn：按子话题分组处理
-          // 加载子话题缓存
-          const subtopicResult = this.subtopicCache.get(topicId);
-          
-          if (subtopicResult && subtopicResult.subtopics.length > 1) {
-            // 有子话题分段：当前子话题保留摘要，旧子话题只保留标签
-            const seqSet = new Set(groupTurns.map((t) => t.sequence));
-            
-            for (const sub of subtopicResult.subtopics) {
-              const subTurns = sub.turnSequences
-                .filter((seq) => seqSet.has(seq))
-                .map((seq) => groupTurns.find((t) => t.sequence === seq))
-                .filter((t): t is TurnIndex => t !== undefined);
-              
-              if (subTurns.length === 0) continue;
-              
-              if (sub.isCurrent) {
-                // 当前子话题：保留 turn 级摘要
-                for (const turn of subTurns.slice(-this.config.sameTopicMaxTurns)) {
-                  const turnState = this.state.turnStates[turn.id];
-                  if (turnState?.compacted && turnState.summary) {
-                    historySections.push(turnState.summary);
-                    usedTokens += turnState.summaryTokens ?? estimateTokens(turnState.summary);
-                  } else {
-                    const line = `[Turn #${turn.sequence}: ${turn.userPreview.slice(0, 80)} → ${turn.assistantPreview.slice(0, 80)}]`;
-                    historySections.push(line);
-                    usedTokens += 30;
-                  }
-                }
-              } else {
-                // 旧子话题：只保留一行标签
-                historySections.push(
-                  `[Sub-topic: ${sub.label} — ${subTurns.length} turns, completed]`,
-                );
-                usedTokens += 15;
-              }
-            }
-          } else {
-            // 没有子话题分段：回退到原来的保留最近 N 个
-            const kept = groupTurns.slice(-this.config.sameTopicMaxTurns);
-            for (const turn of kept) {
-              const turnState = this.state.turnStates[turn.id];
-              if (turnState?.compacted && turnState.summary) {
-                historySections.push(turnState.summary);
-                usedTokens += turnState.summaryTokens ?? estimateTokens(turnState.summary);
-              } else {
-                const line = `[Turn #${turn.sequence}: ${turn.userPreview.slice(0, 80)} → ${turn.assistantPreview.slice(0, 80)}]`;
-                historySections.push(line);
-                usedTokens += 30;
-              }
-            }
-            if (groupTurns.length > kept.length) {
-              const skipped = groupTurns.length - kept.length;
-              historySections.unshift(
-                `[...${skipped} earlier turns in same topic "${topicLabel}" omitted]`,
-              );
-              usedTokens += 15;
-            }
-          }
-        } else {
-          // 跨话题 Turn：按策略处理
-          if (this.config.crossTopicStrategy === "drop") {
-            historySections.push(
-              `[Topic: ${topicLabel} — ${groupTurns.length} turns, completed]`,
-            );
-            usedTokens += 15;
-          } else {
-            // "summarize": topic 级摘要
-            const topicSummary = buildTopicSummaryLine(topicLabel, groupTurns, this.state);
-            historySections.push(topicSummary);
-            usedTokens += estimateTokens(topicSummary);
-          }
+    for (let i = 0; i < recentCutoff; i++) {
+      const turn = turns[i];
+
+      // 话题相关性过滤：不相关的老旧 turn 直接丢弃
+      if (this.config.topicAwareEnabled && allTopics.length > 1) {
+        if (!this.isTurnRelevant(turn, currentTopicId, currentSubtopicId)) {
+          droppedTurns++;
+          continue;
         }
       }
 
-      if (historySections.length > 0) {
-        const summaryBlock = [
-          `[Context Summary — ${allTopics.length} topics detected, ${recentCutoff} earlier turns compacted]`,
-          ...historySections,
-          `[End of summary — current topic continues below]`,
-        ].join("\n");
-        result.push({ role: "user", content: summaryBlock });
-        result.push({ role: "assistant", content: "Understood. I have the context summary of earlier conversation turns. Continuing with the current discussion." });
-      }
-    } else {
-      // ── 原有模式（单 topic 或 topic-aware 关闭）──────────────────
-      const historySummaries: string[] = [];
+      const turnState = this.state.turnStates[turn.id];
 
-      for (let i = 0; i < recentCutoff; i++) {
-        const turn = turns[i];
-        const turnState = this.state.turnStates[turn.id];
+      if (turnState?.compacted && turnState.summary) {
+        // 有 LLM 摘要：用摘要
+        result.push({ role: "user", content: `[Summary of turn #${turn.sequence}]: ${turnState.summary}` });
+        usedTokens += turnState.summaryTokens ?? estimateTokens(turnState.summary);
+      } else {
+        // 无摘要：放入原始消息，tool result 用 cache 截断版本
+        const rawLines = await query.readTurnRaw(turn.id);
+        let msgIdx = 0;
 
-        if (turnState?.compacted && turnState.summary) {
-          historySummaries.push(turnState.summary);
-          usedTokens += turnState.summaryTokens ?? estimateTokens(turnState.summary);
-        } else {
-          historySummaries.push(
-            `[Turn #${turn.sequence}: ${turn.userPreview.slice(0, 80)} → ${turn.assistantPreview.slice(0, 80)}]`,
-          );
-          usedTokens += 30;
+        for (const line of rawLines) {
+          try {
+            const obj = JSON.parse(line);
+            if (obj.type !== "message") continue;
+            const msg = obj.message;
+
+            if (msg.role === "user") {
+              const text = extractText(msg.content);
+              result.push({ role: "user", content: text });
+              usedTokens += estimateTokens(text);
+            } else if (msg.role === "assistant") {
+              const text = extractText(msg.content);
+              if (text) {
+                result.push({ role: "assistant", content: text });
+                usedTokens += estimateTokens(text);
+              }
+            } else if (msg.role === "toolResult") {
+              // tool result：优先用 cache 中的截断版本
+              const cached = getCachedToolResult(toolResultCache, turn.id, msgIdx);
+              const text = cached ? cached.truncatedContent : extractText(msg.content);
+              result.push({ role: "tool", content: text, ...(msg.toolName ? { toolName: msg.toolName } : {}) });
+              usedTokens += cached ? cached.truncatedTokens : estimateTokens(text);
+            }
+          } catch {
+            // 解析失败，跳过
+          }
+          msgIdx++;
         }
-      }
-
-      if (historySummaries.length > 0) {
-        const summaryBlock = [
-          `[Context Summary — ${historySummaries.length} earlier turns compacted]`,
-          ...historySummaries,
-          `[End of summary — recent conversation follows]`,
-        ].join("\n");
-        result.push({ role: "user", content: summaryBlock });
-        result.push({ role: "assistant", content: "Understood. I have the context summary of earlier conversation turns. Continuing with the current discussion." });
-        usedTokens += estimateTokens(summaryBlock);
       }
     }
 
-    // Phase 2: 最近 N 个 Turn — 保留对话骨架，裁剪大体积 tool result
+    if (droppedTurns > 0) {
+      this.config.logger?.info(
+        `[assemble] dropped ${droppedTurns} irrelevant turns (different topic/subtopic)`,
+      );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Phase 2: 保护区 Turn — 原文原样保留
+    // ══════════════════════════════════════════════════════════════════
     if (recentCutoff < turns.length) {
       let recentMessageCount = 0;
       for (let i = recentCutoff; i < turns.length; i++) {
@@ -359,42 +326,91 @@ export class TurnIndexedContextEngine {
       }
 
       const recentMessages = allMessages.slice(-recentMessageCount);
-
-      // 去重跟踪：连续重复的 tool result 只保留第一次
-      const seenToolResults = new Map<string, number>();
-
       for (const msg of recentMessages) {
-        const trimmed = trimMessageForContext(msg, this.config.toolResultMaxTokens);
+        result.push(msg);
+        usedTokens += estimateMessageTokens(msg);
+      }
+    }
 
-        // 检测重复的 tool result
-        if (trimmed.role === "tool" && typeof trimmed.content === "string") {
-          const key = trimmed.content.slice(0, 200);
-          const count = seenToolResults.get(key) ?? 0;
-          seenToolResults.set(key, count + 1);
-          if (count > 0) {
-            // 重复的 tool result 压缩为一行
-            const deduped: EngineMessage = {
-              ...trimmed,
-              content: `(same as above, repeated ${count + 1}x)`,
-            };
-            result.push(deduped);
-            usedTokens += 10;
-            continue;
+    // ══════════════════════════════════════════════════════════════════
+    // Phase 3: 预压缩 — 每次 assemble 后检查是否超阈值
+    //   超阈值 → 对非保护区大 tool result 做 head+tail 截断（0成本）
+    //   仍超 → 异步触发 LLM 压缩
+    //   截断/压缩结果下次 assemble 生效（KV cache 友好）
+    // ══════════════════════════════════════════════════════════════════
+    const thresholdTokens = tokenBudget * this.config.compactionThreshold;
+
+    if (usedTokens > thresholdTokens) {
+      this.config.logger?.info(
+        `[pre-compact] total ${usedTokens} tokens exceeds threshold ${Math.round(thresholdTokens)}, running pre-compaction`,
+      );
+
+      const maxChars = this.config.toolResultTruncateChars;
+      let tokensSaved = 0;
+
+      // Step 1: 对非保护区 turn 中尚未截断的大 tool result 做 head+tail 截断
+      for (let i = 0; i < recentCutoff; i++) {
+        const turn = turns[i];
+        // 已有 LLM 摘要的 turn 不需要截断（它在 prompt 中已经是摘要形式）
+        const turnState = this.state.turnStates[turn.id];
+        if (turnState?.compacted) continue;
+
+        const rawLines = await query.readTurnRaw(turn.id);
+        let msgIdx = 0;
+
+        for (const line of rawLines) {
+          try {
+            const obj = JSON.parse(line);
+            if (obj.type !== "message") continue;
+            const msg = obj.message;
+            if (msg.role !== "toolResult") { msgIdx++; continue; }
+
+            // 已缓存的跳过
+            const cached = getCachedToolResult(toolResultCache, turn.id, msgIdx);
+            if (cached) { msgIdx++; continue; }
+
+            const text = extractText(msg.content);
+            if (text.length <= maxChars) { msgIdx++; continue; }
+
+            // 执行 head+tail 截断
+            const truncated = truncateHeadTail(text, maxChars);
+            const originalTokens = estimateTokens(text);
+            const truncatedTokens = estimateTokens(truncated);
+
+            setCachedToolResult(toolResultCache, turn.id, msgIdx, {
+              truncatedContent: truncated,
+              truncatedTokens,
+              originalTokens,
+              originalChars: text.length,
+              truncatedAt: new Date().toISOString(),
+            });
+            toolResultCacheDirty = true;
+            tokensSaved += originalTokens - truncatedTokens;
+
+            this.config.logger?.info(
+              `[pre-compact] truncated tool result turn #${turn.sequence} msgIdx=${msgIdx}: ${text.length} → ${truncated.length} chars, saved ~${originalTokens - truncatedTokens} tokens`,
+            );
+          } catch {
+            // skip
           }
+          msgIdx++;
         }
 
-        const msgTokens = estimateMessageTokens(trimmed);
+        // 截断已足够
+        if (usedTokens - tokensSaved <= thresholdTokens) break;
+      }
 
-        if (usedTokens + msgTokens > tokenBudget) {
-          if (trimmed.role === "user" || trimmed.role === "assistant") {
-            result.push(trimmed);
-            usedTokens += msgTokens;
-          }
-          continue;
-        }
+      // 持久化
+      if (toolResultCacheDirty) {
+        await saveToolResultCache(sessionFile, toolResultCache);
+        this.config.logger?.info(
+          `[pre-compact] tool result cache saved, ~${tokensSaved} tokens will be freed next assemble`,
+        );
+      }
 
-        result.push(trimmed);
-        usedTokens += msgTokens;
+      // Step 2: 截断后仍超阈值 → 异步触发 LLM 压缩
+      if (usedTokens - tokensSaved > thresholdTokens) {
+        this.triggerAsyncCompaction(sessionFile);
       }
     }
 
@@ -402,6 +418,96 @@ export class TurnIndexedContextEngine {
       messages: result,
       tokenCount: usedTokens,
     };
+  }
+
+  // ── Tool Result Cache 管理 ─────────────────────────────────────────────
+
+  /**
+   * 获取或加载 tool result 缓存。
+   * 缓存加载后保留在内存中，后续 assemble 直接使用。
+   */
+  private async getToolResultCache(sessionFile: string): Promise<ToolResultCache> {
+    const cached = this.toolResultCacheMap.get(sessionFile);
+    if (cached) return cached;
+
+    const loaded = await loadToolResultCache(sessionFile);
+    this.toolResultCacheMap.set(sessionFile, loaded);
+    return loaded;
+  }
+
+  // ── 话题相关性判定 ─────────────────────────────────────────────
+
+  /**
+   * 获取当前子话题包含的 turn sequence 集合。
+   * 如果没有子话题信息，返回 null（表示不做子话题级过滤）。
+   */
+  /**
+   * 获取当前子话题 ID。
+   */
+  private getCurrentSubtopicId(currentTopicId: string | undefined): string | null {
+    if (!currentTopicId) return null;
+    const subtopicResult = this.subtopicCache.get(currentTopicId);
+    if (!subtopicResult || subtopicResult.subtopics.length <= 1) return null;
+
+    const currentSub = subtopicResult.subtopics.find(s => s.isCurrent);
+    return currentSub?.id ?? null;
+  }
+
+  /**
+   * 判断一个非保护区 turn 是否与当前上下文相关。
+   *
+   * 规则：
+   *   1. 不同大话题 → 不相关（丢弃）
+   *   2. 同大话题 + turn 有 subtopicId + 与当前 subtopicId 不同 → 不相关（丢弃）
+   *   3. 同大话题 + turn 无 subtopicId → 相关（保留，还未分类）
+   *   4. 同大话题 + 同 subtopicId → 相关（保留）
+   */
+  private isTurnRelevant(
+    turn: TurnIndex,
+    currentTopicId: string | undefined,
+    currentSubtopicId: string | null,
+  ): boolean {
+    // 不同大话题 → 不相关
+    if (turn.topicId !== currentTopicId) {
+      return false;
+    }
+
+    // 同大话题，检查子话题
+    if (currentSubtopicId && turn.subtopicId) {
+      return turn.subtopicId === currentSubtopicId;
+    }
+
+    // turn 还未分类或无当前子话题信息 → 保留
+    return true;
+  }
+
+  // ── 异步 LLM 压缩触发 ─────────────────────────────────────────────────
+
+  /**
+   * 异步触发早期 turn 的 LLM 摘要压缩。
+   * 不阻塞当前 assemble，压缩完成后更新索引缓存，下次 assemble 生效。
+   */
+  private triggerAsyncCompaction(sessionFile: string): void {
+    if (this.pendingCompactions.has(sessionFile)) return; // 已有进行中的压缩任务
+
+    this.pendingCompactions.add(sessionFile);
+    this.config.logger?.info(`[assemble] triggering async compaction for ${sessionFile}`);
+
+    // 异步执行，不 await
+    this.compact(sessionFile)
+      .then((result) => {
+        this.config.logger?.info(
+          `[async-compact] completed: ${result.compactedCount} turns, ${result.tokensSaved} tokens saved, ${result.llmCalls} LLM calls`,
+        );
+      })
+      .catch((err) => {
+        this.config.logger?.error(
+          `[async-compact] failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      })
+      .finally(() => {
+        this.pendingCompactions.delete(sessionFile);
+      });
   }
 
   // ── compact：压缩旧 Turn，生成摘要 ───────────────────────────────────
@@ -442,10 +548,12 @@ export class TurnIndexedContextEngine {
     let cacheHits = 0;
     let dirty = false;
 
+    // 先处理已缓存的 turn（恢复内存状态，不调 LLM）
+    const uncachedTurns: TurnIndex[] = [];
+
     for (let i = 0; i < compactCutoff; i++) {
       const turn = turns[i];
 
-      // ── 检查磁盘缓存 ──
       const cached = getCachedSummary(cache, turn.id);
       if (cached) {
         // 缓存命中：直接用缓存，不调 LLM
@@ -459,28 +567,49 @@ export class TurnIndexedContextEngine {
         cacheHits++;
         compactedCount++;
         tokensSaved += cached.originalTokens - cached.tokens;
-        continue;
+      } else {
+        uncachedTurns.push(turn);
       }
+    }
 
-      // ── 生成摘要 ──
+    // 按 totalTokens 降序排列，挑选 top-N 最大的 turn 进行 LLM 压缩
+    const maxPerCycle = this.config.maxCompactionsPerCycle;
+    const toCompact = uncachedTurns
+      .slice() // 不破坏原数组
+      .sort((a, b) => b.totalTokens - a.totalTokens)
+      .slice(0, maxPerCycle);
+
+    if (toCompact.length > 0) {
+      this.config.logger?.info(
+        `[compact] selecting top ${toCompact.length} largest turns (of ${uncachedTurns.length} uncached): ${toCompact.map(t => `#${t.sequence}(${t.totalTokens}tok)`).join(", ")}`,
+      );
+    }
+
+    for (const turn of toCompact) {
       const rawLines = await query.readTurnRaw(turn.id);
 
-      // 构建给 LLM 的输入：只取关键信息，避免发送大量 tool output
-      const turnContent = buildCompactInput(turn, rawLines);
+      // 加载 tool result cache，让 buildCompactInput 使用截断后的 tool result
+      const trCache = await this.getToolResultCache(sessionFile);
+
+      // 构建给 LLM 的输入：使用截断后的 tool result，降低输入 token 数
+      const turnContent = buildCompactInput(turn, rawLines, trCache);
 
       let summary: string;
       let method: "local" | "llm" = "local";
 
       if (this.config.summarize) {
         try {
+          this.config.logger?.info(`[compact] turn #${turn.sequence} (${turn.totalTokens} tokens): calling LLM for summary`);
           summary = await this.config.summarize(
             turnContent,
             `Turn #${turn.sequence}: user asked "${turn.userPreview.slice(0, 100)}"`,
           );
           method = "llm";
           llmCalls++;
-        } catch {
-          // LLM 失败，回退到本地提取
+          this.config.logger?.info(`[compact] turn #${turn.sequence}: LLM summary OK (${summary.length} chars)`);
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          this.config.logger?.error(`[compact] turn #${turn.sequence}: LLM summary failed: ${errMsg}`);
           summary = buildLocalSummary(turn, rawLines);
         }
       } else {
@@ -522,67 +651,150 @@ export class TurnIndexedContextEngine {
       this.state.lastCompactedAt = new Date().toISOString();
     }
 
-    // ── 子话题检测（compact 后触发）──────────────────────────────
-    if (this.config.topicAwareEnabled && compactedCount > 0) {
-      await this.runSubTopicDetection(sessionFile);
-    }
-
     return { compactedCount, tokensSaved, llmCalls, cacheHits };
   }
 
   /**
-   * 对每个大话题运行子话题检测。
-   * 结果缓存到内存和磁盘。
+   * 从磁盘加载子话题缓存到内存（仅读取，不触发检测）。
+   * assemble 时调用，确保过滤时有子话题数据可用。
    */
-  private async runSubTopicDetection(sessionFile: string): Promise<void> {
+  private async loadSubTopicCacheIfNeeded(sessionFile: string): Promise<void> {
+    if (this.subtopicCacheLoaded) return;
+    const diskCache = await loadSubTopicCache(sessionFile);
+    for (const [topicId, result] of Object.entries(diskCache.entries)) {
+      this.subtopicCache.set(topicId, result as SubTopicResult);
+    }
+    this.subtopicCacheLoaded = true;
+  }
+
+  // ── Turn 完成回调：异步轻量话题抽取 ─────────────────────────
+
+  /**
+   * 当一轮 turn 完整结束时（收到最终 assistant 回复后）调用。
+   * 异步发起轻量 LLM 话题抽取，不阻塞当前流程。
+   *
+   * 输入精简：只用 userPreview + assistantPreview + toolsUsed，
+   * 不传大段 tool result 或完整模型回复。
+   */
+  onTurnComplete(sessionFile: string, turn: TurnIndex): void {
+    if (!this.config.topicAwareEnabled) return;
+    if (!this.config.summarize) return; // 没有 LLM 函数则跳过
+
+    // 异步执行，不阻塞
+    this.classifyTurnTopic(sessionFile, turn).catch((err) => {
+      this.config.logger?.error(
+        `[topic-classify] turn #${turn.sequence} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
+
+  /**
+   * 轻量 LLM 话题分类：对单个 turn 抽取话题标签并判断是否属于当前子话题。
+   *
+   * 输入约 100-200 tokens，输出约 30-50 tokens。
+   */
+  private async classifyTurnTopic(sessionFile: string, turn: TurnIndex): Promise<void> {
     const { query } = await this.getIndex(sessionFile);
     const allTopics = query.getAllTopics();
-    const turns = query.getAllTurns();
-    const subtopicDiskCache = await loadSubTopicCache(sessionFile);
-    let dirty = false;
 
-    for (const topic of allTopics) {
-      // 跳过已缓存的（除非 turn 数量变了）
-      const cached = subtopicDiskCache.entries[topic.id];
-      if (cached) {
-        const cachedTurnCount = cached.subtopics.reduce(
-          (sum, s) => sum + s.turnSequences.length, 0,
-        );
-        if (cachedTurnCount === topic.turnIds.length) {
-          this.subtopicCache.set(topic.id, cached);
-          continue;
+    // 构建精简输入：只用 preview + 工具名
+    const input = buildTopicClassifyInput(turn, allTopics);
+
+    try {
+      const llmOutput = await this.config.summarize!(
+        input,
+        "Classify this turn's sub-topic. Reply JSON: {\"subtopic\": \"<short label>\", \"isNewSubtopic\": bool}",
+      );
+
+      const classification = parseTopicClassifyResult(llmOutput);
+      if (!classification) return;
+
+      // 更新子话题缓存
+      await this.updateSubTopicCache(
+        sessionFile,
+        turn,
+        classification.subtopic,
+        classification.isNewSubtopic,
+      );
+    } catch (err) {
+      this.config.logger?.error(
+        `[topic-classify] LLM call failed for turn #${turn.sequence}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * 更新子话题缓存：将 turn 归入现有子话题或创建新子话题。
+   */
+  private async updateSubTopicCache(
+    sessionFile: string,
+    turn: TurnIndex,
+    subtopicLabel: string,
+    isNew: boolean,
+  ): Promise<void> {
+    const topicId = turn.topicId;
+    if (!topicId) return;
+
+    const diskCache = await loadSubTopicCache(sessionFile);
+    let result = diskCache.entries[topicId] ?? {
+      topicId,
+      subtopics: [],
+      method: "llm" as const,
+      createdAt: new Date().toISOString(),
+    };
+
+    if (isNew || result.subtopics.length === 0) {
+      // 新子话题：把之前的标记为非当前
+      result.subtopics = result.subtopics.map(s => ({ ...s, isCurrent: false }));
+      result.subtopics.push({
+        id: `${topicId}-sub-${result.subtopics.length}`,
+        label: subtopicLabel,
+        turnSequences: [turn.sequence],
+        isCurrent: true,
+      });
+    } else {
+      // 归入当前子话题
+      const current = result.subtopics.find(s => s.isCurrent);
+      if (current) {
+        if (!current.turnSequences.includes(turn.sequence)) {
+          current.turnSequences.push(turn.sequence);
+        }
+      } else {
+        // 没有当前子话题，归入最后一个
+        const last = result.subtopics[result.subtopics.length - 1];
+        if (last && !last.turnSequences.includes(turn.sequence)) {
+          last.turnSequences.push(turn.sequence);
+          last.isCurrent = true;
         }
       }
-
-      // 取该 topic 下的 turns
-      const topicTurns = topic.turnIds
-        .map((id) => turns.find((t) => t.id === id))
-        .filter((t): t is TurnIndex => t !== undefined);
-
-      if (topicTurns.length < 3) {
-        // 太少不值得分子话题
-        continue;
-      }
-
-      let result: SubTopicResult;
-      if (this.config.summarize) {
-        // 复用 summarize 函数作为 LLM classify
-        result = await detectSubTopicsByLlm(
-          topic.id,
-          topicTurns,
-          this.config.summarize,
-        );
-      } else {
-        result = detectSubTopicsByHeuristic(topic.id, topicTurns);
-      }
-
-      this.subtopicCache.set(topic.id, result);
-      subtopicDiskCache.entries[topic.id] = result;
-      dirty = true;
     }
 
-    if (dirty) {
-      await saveSubTopicCache(sessionFile, subtopicDiskCache);
+    diskCache.entries[topicId] = result;
+    await saveSubTopicCache(sessionFile, diskCache);
+
+    // 回填 turn 索引中的 subtopicId/subtopicLabel
+    const currentSub = result.subtopics.find(s => s.isCurrent);
+    if (currentSub) {
+      turn.subtopicId = currentSub.id;
+      turn.subtopicLabel = currentSub.label;
+      // 持久化索引更新（异步保存，不阻塞）
+      this.persistIndexUpdate(sessionFile).catch(() => {});
+    }
+
+    // 同步到内存
+    this.subtopicCache.set(topicId, result);
+    this.config.logger?.info(
+      `[topic-classify] turn #${turn.sequence} → subtopic "${subtopicLabel}" (${isNew ? "new" : "existing"})`,
+    );
+  }
+
+  /**
+   * 异步保存索引更新到磁盘（subtopicId 回填后）。
+   */
+  private async persistIndexUpdate(sessionFile: string): Promise<void> {
+    const cached = this.indexCache.get(sessionFile);
+    if (cached) {
+      await saveIndex(sessionFile, cached.index);
     }
   }
 
@@ -736,13 +948,13 @@ function estimateMessagesTokens(msgs: EngineMessage[]): number {
 const DEFAULT_TOOL_RESULT_MAX_TOKENS = 800;
 
 /**
- * 对单条消息做智能裁剪：
+ * 对单条消息做智能裁剪（保留作为工具函数导出）：
  *   - user / assistant 消息：不截断（这是对话的核心意图和结果）
  *   - tool result：截断到 maxTokens
  *     因为 tool 输出通常是大段文件内容、命令输出、错误堆栈，
  *     头尾部分足够理解上下文，中间可以省略。
  */
-function trimMessageForContext(
+export function trimMessageForContext(
   msg: EngineMessage,
   maxTokens: number = DEFAULT_TOOL_RESULT_MAX_TOKENS,
 ): EngineMessage {
@@ -771,14 +983,14 @@ function trimMessageForContext(
   if (typeof msg.content === "string") {
     return {
       ...msg,
-      content: truncateHeadTail(msg.content, maxTokens),
+      content: truncateHeadTailByTokens(msg.content, maxTokens),
     };
   }
 
   if (Array.isArray(msg.content)) {
     const trimmed = msg.content.map((part) => {
       if (typeof part.text === "string" && estimateTokens(part.text) > maxTokens) {
-        return { ...part, text: truncateHeadTail(part.text, maxTokens) };
+        return { ...part, text: truncateHeadTailByTokens(part.text, maxTokens) };
       }
       return part;
     });
@@ -789,10 +1001,11 @@ function trimMessageForContext(
 }
 
 /**
- * 头尾截断：保留前 60% 和后 30% 的 token，中间用省略标记。
+ * 头尾截断（token-based）：保留前 60% 和后 30% 的 token，中间用省略标记。
+ * 用于保护区内的 trimMessageForContext。
  * 这样上下文两头都能看到，中间重复部分被省略。
  */
-function truncateHeadTail(text: string, maxTokens: number): string {
+function truncateHeadTailByTokens(text: string, maxTokens: number): string {
   // 粗略估算：1 token ≈ 4 chars
   const maxChars = maxTokens * 4;
   if (text.length <= maxChars) return text;
@@ -846,12 +1059,13 @@ function buildLocalSummary(turn: TurnIndex, _rawLines: string[]): string {
  * 这样 LLM 能理解这轮做了什么，但不会被大量文件内容淡化注意力。
  * 同时也避免了发送大量 token，控制摘要调用的 KV cache 成本。
  */
-function buildCompactInput(turn: TurnIndex, rawLines: string[]): string {
+function buildCompactInput(turn: TurnIndex, rawLines: string[], toolResultCache?: ToolResultCache): string {
   const parts: string[] = [];
 
   parts.push(`[Turn #${turn.sequence} | ${turn.messageCount} messages | ${turn.toolsUsed.length} tools]`);
   parts.push(``);
 
+  let msgIdx = 0;
   for (const line of rawLines) {
     try {
       const obj = JSON.parse(line);
@@ -872,15 +1086,16 @@ function buildCompactInput(turn: TurnIndex, rawLines: string[]): string {
           parts.push(`[ToolCalls]: ${toolCalls.join(", ")}`);
         }
       } else if (msg.role === "toolResult") {
-        const text = extractText(msg.content);
-        const preview = text.slice(0, 200);
-        const suffix = text.length > 200 ? `... [${text.length} chars total]` : "";
+        // tool result：优先用 cache 中的截断版本，否则用原始全文
+        const cached = toolResultCache ? getCachedToolResult(toolResultCache, turn.id, msgIdx) : null;
+        const text = cached ? cached.truncatedContent : extractText(msg.content);
         const err = msg.isError ? " ❌ ERROR" : "";
-        parts.push(`[Tool ${msg.toolName || "?"}${err}]: ${preview}${suffix}`);
+        parts.push(`[Tool ${msg.toolName || "?"}${err}]: ${text}`);
       }
     } catch {
       // 解析失败，跳过
     }
+    msgIdx++;
   }
 
   return parts.join("\n");
@@ -938,3 +1153,64 @@ function stripSenderMetadataFromContent(content: unknown): unknown {
   }
   return content;
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+//  轻量话题分类 — 辅助函数
+// ═════════════════════════════════════════════════════════════════════════
+
+/**
+ * 构建轻量话题分类的 LLM 输入。
+ * 只用 preview + 工具名，约 100-200 tokens。
+ */
+function buildTopicClassifyInput(turn: TurnIndex, allTopics: TopicIndex[]): string {
+  const parts: string[] = [];
+
+  // 当前话题列表（给 LLM 上下文）
+  if (allTopics.length > 0) {
+    const topicLabels = allTopics.map(t => t.label).filter(Boolean);
+    if (topicLabels.length > 0) {
+      parts.push(`Existing topics: ${topicLabels.join(", ")}`);
+    }
+  }
+
+  // Turn 摘要信息
+  parts.push(`Turn #${turn.sequence}:`);
+  parts.push(`  User: ${turn.userPreview.slice(0, 150)}`);
+  parts.push(`  Assistant: ${turn.assistantPreview.slice(0, 150)}`);
+  if (turn.toolsUsed.length > 0) {
+    parts.push(`  Tools: ${turn.toolsUsed.join(", ")}`);
+  }
+
+  return parts.join("\n");
+}
+
+/**
+ * 解析 LLM 话题分类结果。
+ * 期望格式：{"subtopic": "<label>", "isNewSubtopic": bool}
+ */
+function parseTopicClassifyResult(
+  llmOutput: string,
+): { subtopic: string; isNewSubtopic: boolean } | null {
+  try {
+    // 尝试直接解析
+    const parsed = JSON.parse(llmOutput);
+    if (parsed.subtopic && typeof parsed.isNewSubtopic === "boolean") {
+      return { subtopic: parsed.subtopic, isNewSubtopic: parsed.isNewSubtopic };
+    }
+  } catch {
+    // 尝试提取 JSON 块
+    const match = llmOutput.match(/\{[^}]*"subtopic"[^}]*\}/);
+    if (match) {
+      try {
+        const parsed = JSON.parse(match[0]);
+        if (parsed.subtopic && typeof parsed.isNewSubtopic === "boolean") {
+          return { subtopic: parsed.subtopic, isNewSubtopic: parsed.isNewSubtopic };
+        }
+      } catch {
+        // fall through
+      }
+    }
+  }
+  return null;
+}
+

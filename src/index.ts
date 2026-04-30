@@ -72,8 +72,10 @@ export default definePluginEntry({
         ].join("\n");
 
         const sessionKey = `context-manager-summarize-${Date.now()}`;
+        const idempotencyKey = `contextfold-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const runResult = await runtime.subagent.run({
           sessionKey,
+          idempotencyKey,
           message: prompt,
           ...(typeof pluginConfig.summaryModel === "string" ? { model: pluginConfig.summaryModel } : {}),
         });
@@ -118,6 +120,7 @@ export default definePluginEntry({
               : undefined,
         },
         summarize: summarizeFn,
+        logger: api.logger,
       }),
     );
 
@@ -937,7 +940,7 @@ export default definePluginEntry({
       }),
       async execute(_id, params) {
         try {
-          const { detectSubTopicsByHeuristic } = await import("./topic/subtopic-detector.js");
+          const { detectSubTopicsByLlm, detectSubTopicsByHeuristic } = await import("./topic/subtopic-detector.js");
           const { loadSubTopicCache: loadSTCache, saveSubTopicCache: saveSTCache } = await import("./topic/subtopic-cache.js");
           
           const { query } = await getOrBuildIndex(params.sessionFile);
@@ -963,7 +966,14 @@ export default definePluginEntry({
             }
 
             // 优先用 LLM（通过 engine 的 summarize 函数），回退到启发式
-            const result = detectSubTopicsByHeuristic(topic.id, topicTurns);
+            let result;
+            if (summarizeFn) {
+              api.logger.info(`[detect_subtopics] topic=${topic.id}: using LLM mode`);
+              result = await detectSubTopicsByLlm(topic.id, topicTurns, summarizeFn, api.logger);
+            } else {
+              api.logger.info(`[detect_subtopics] topic=${topic.id}: no summarizeFn, using heuristic`);
+              result = detectSubTopicsByHeuristic(topic.id, topicTurns);
+            }
             cache.entries[topic.id] = result;
             detected++;
             totalSubtopics += result.subtopics.length;

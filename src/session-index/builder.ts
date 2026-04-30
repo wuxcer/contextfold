@@ -106,11 +106,14 @@ interface PendingTurn {
   lineEnd: number;
   messageCount: number;
   totalTokens: number;
+  /** 各角色 token 细分 */
+  userTokens: number;
+  assistantTokens: number;
+  toolResultTokens: number;
   toolsUsed: Set<string>;
   toolCallCount: number;
   hasError: boolean;
   userPreview: string;
-  userTokens: number;
   assistantPreview: string;
   hasAssistantText: boolean;
   startTime: string;
@@ -132,6 +135,11 @@ function buildTurns(parsed: ParsedLine[]): TurnIndex[] {
       toolsUsed: [...p.toolsUsed],
       toolCallCount: p.toolCallCount,
       totalTokens: p.totalTokens,
+      tokenBreakdown: {
+        user: p.userTokens,
+        assistant: p.assistantTokens,
+        toolResult: p.toolResultTokens,
+      },
       userPreview: p.userPreview,
       assistantPreview: p.assistantPreview,
       startTime: p.startTime,
@@ -157,11 +165,13 @@ function buildTurns(parsed: ParsedLine[]): TurnIndex[] {
         lineEnd: line.line,
         messageCount: 1,
         totalTokens: line.tokenEstimate ?? 0,
+        userTokens: line.tokenEstimate ?? 0,
+        assistantTokens: 0,
+        toolResultTokens: 0,
         toolsUsed: new Set(),
         toolCallCount: 0,
         hasError: false,
         userPreview: line.userText ?? "",
-        userTokens: line.tokenEstimate ?? 0,
         assistantPreview: "",
         hasAssistantText: false,
         startTime: line.timestamp,
@@ -175,6 +185,7 @@ function buildTurns(parsed: ParsedLine[]): TurnIndex[] {
       pending.endTime = line.timestamp;
 
       if (line.role === "assistant") {
+        pending.assistantTokens += line.tokenEstimate ?? 0;
         // 取最后一次有文本的 assistant 回复作为预览
         if (line.assistantText) {
           pending.assistantPreview = line.assistantText;
@@ -188,6 +199,7 @@ function buildTurns(parsed: ParsedLine[]): TurnIndex[] {
           }
         }
       } else if (line.role === "toolResult") {
+        pending.toolResultTokens += line.tokenEstimate ?? 0;
         if (line.toolName) pending.toolsUsed.add(line.toolName);
         if (line.isError) pending.hasError = true;
       }
@@ -393,6 +405,11 @@ async function mergeIncremental(
       lineEnd: firstNew.lineEnd,
       messageCount: lastExisting.messageCount + firstNew.messageCount,
       totalTokens: lastExisting.totalTokens + firstNew.totalTokens,
+      tokenBreakdown: {
+        user: (lastExisting.tokenBreakdown?.user ?? 0) + (firstNew.tokenBreakdown?.user ?? 0),
+        assistant: (lastExisting.tokenBreakdown?.assistant ?? 0) + (firstNew.tokenBreakdown?.assistant ?? 0),
+        toolResult: (lastExisting.tokenBreakdown?.toolResult ?? 0) + (firstNew.tokenBreakdown?.toolResult ?? 0),
+      },
       toolsUsed: [...new Set([...lastExisting.toolsUsed, ...firstNew.toolsUsed])],
       toolCallCount: lastExisting.toolCallCount + firstNew.toolCallCount,
       hasError: lastExisting.hasError || firstNew.hasError,
