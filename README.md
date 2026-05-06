@@ -315,15 +315,22 @@ npm run lint      # Lint
 
 ## Changelog
 
-See [git log](https://github.com/wuxcer/openclaw-contextfold) for full history.
+See [CHANGELOG.md](./CHANGELOG.md) for full history.
 
-### Recent
+### v0.0.2 (2026-05-06)
 
-- **Phase 4: Content normalization** — all assembled messages now have `content` as `ContentPart[]` for OpenClaw Pi runtime compatibility
-- **Ingest lifecycle** — adapter now hooks `ingest()` to trigger async index updates and subtopic detection on turn completion
+- **Content normalization (Phase 4)** — all assembled messages now have `content` as `ContentPart[]` for OpenClaw Pi runtime compatibility
+- **Fix: `content.flatMap is not a function`** — hardened `ensureArrayContent()` to handle string, null, and non-object content
+- **Ingest lifecycle** — adapter hooks `ingest()` for async index updates and subtopic detection on turn completion
 - **Per-turn subtopicId** — stored directly in `TurnIndex` for O(1) lookup during assemble
 - **Selective LLM compaction** — only top-N largest turns are compressed per cycle
 - **Tool result head+tail truncation** — large tool results cached with 40K char limit (zero-cost)
+- **Topic/subtopic fallback compaction** — graceful degradation when LLM summarization fails
+- **Assemble rewrite** — uses original messages with cached tool results for higher-fidelity context
+
+### v0.0.1 (2026-04-28)
+
+- Initial release: turn-indexed context engine, topic segmentation, sub-topic detection, 18 agent tools, pruning strategies, LLM summary caching
 
 ## License
 

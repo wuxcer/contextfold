@@ -26,3 +26,12 @@ export {
   type CachedToolResult,
   type TurnToolResultCache,
 } from "./tool-result-cache.js";
+export {
+  loadTopicCompactionCache,
+  saveTopicCompactionCache,
+  getTopicCompaction,
+  setTopicCompaction,
+  getTopicCompactionStats,
+  type TopicCompactionCache,
+  type TopicCompactionEntry,
+} from "./topic-compaction-cache.js";

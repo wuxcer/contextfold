@@ -1,6 +1,6 @@
 {
   "name": "@openclaw/contextfold",
-  "version": "1.0.0",
+  "version": "0.0.2",
   "type": "module",
   "description": "ContextFold — topic-aware context folding plugin for OpenClaw. Detects conversation topics, compresses losslessly, recovers on demand.",
   "main": "dist/index.js",

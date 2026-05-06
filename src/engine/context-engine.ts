@@ -36,6 +36,14 @@ import {
   type ToolResultCache,
 } from "./tool-result-cache.js";
 import {
+  loadTopicCompactionCache,
+  saveTopicCompactionCache,
+  getTopicCompaction,
+  setTopicCompaction,
+  type TopicCompactionCache,
+  type TopicCompactionEntry,
+} from "./topic-compaction-cache.js";
+import {
   type SubTopicResult,
 } from "../topic/subtopic-detector.js";
 import {
@@ -165,6 +173,10 @@ export class TurnIndexedContextEngine {
   private toolResultCacheMap = new Map<string, ToolResultCache>();
   /** 异步压缩任务键记录，避免重复触发 */
   private pendingCompactions = new Set<string>();
+  /** topic compaction 缓存（内存副本） */
+  private topicCompactionCacheMap = new Map<string, TopicCompactionCache>();
+  /** 异步 topic compaction 任务标记 */
+  private pendingTopicCompactions = new Set<string>();
 
   constructor(config: Partial<EngineConfig> = {}) {
     this.config = { ...DEFAULT_ENGINE_CONFIG, ...config };
@@ -239,6 +251,9 @@ export class TurnIndexedContextEngine {
     const toolResultCache = await this.getToolResultCache(sessionFile);
     let toolResultCacheDirty = false;
 
+    // 加载 topic compaction 缓存
+    const topicCompactionCache = await this.getTopicCompactionCache(sessionFile);
+
     // ── 话题相关性检测 ────────────────────────────────────────────
     const topics = query.getActiveTopics();
     const allTopics = query.getAllTopics ? query.getAllTopics() : topics;
@@ -250,7 +265,51 @@ export class TurnIndexedContextEngine {
     const currentSubtopicId = this.getCurrentSubtopicId(currentTopicId);
 
     // ══════════════════════════════════════════════════════════════════
+    // Phase 0.5: Topic/SubTopic Compaction — 已有压缩的，直接用 summary
+    //   跟踪哪些 topicId / turnId 已被 compaction 覆盖，Phase 1 中跳过其 turn
+    // ══════════════════════════════════════════════════════════════════
+    const topicCompactedIds = new Set<string>();
+    /** subtopic compaction 覆盖的 turnId 集合 */
+    const subtopicCompactedTurnIds = new Set<string>();
+
+    for (const [cacheKey, entry] of Object.entries(topicCompactionCache.entries)) {
+      // cacheKey 可能是：
+      //   - 纯 topicId（整个 topic 压缩）
+      //   - "topicId:subtopicId"（子话题压缩）
+      const isSubtopicKey = cacheKey.includes(":");
+
+      if (isSubtopicKey) {
+        // 子话题压缩：输出 summary，并记录其覆盖的 turnIds
+        result.push({
+          role: "user",
+          content: `[Sub-topic Summary: ${entry.topicLabel} (${entry.turnCount} turns)]: ${entry.summary}`,
+        });
+        usedTokens += entry.summaryTokens;
+        for (const turnId of entry.turnIds) {
+          subtopicCompactedTurnIds.add(turnId);
+        }
+        this.config.logger?.info(
+          `[assemble] using subtopic compaction for "${entry.topicLabel}": ${entry.summaryTokens} tokens (was ${entry.originalTokens})`,
+        );
+      } else {
+        // 整个 topic 压缩：只对非当前话题生效
+        if (cacheKey !== currentTopicId) {
+          result.push({
+            role: "user",
+            content: `[Topic Summary: ${entry.topicLabel} (${entry.turnCount} turns)]: ${entry.summary}`,
+          });
+          usedTokens += entry.summaryTokens;
+          topicCompactedIds.add(cacheKey);
+          this.config.logger?.info(
+            `[assemble] using topic compaction for "${entry.topicLabel}": ${entry.summaryTokens} tokens (was ${entry.originalTokens})`,
+          );
+        }
+      }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
     // Phase 1: 非保护区 turn
+    //   - topic 已被 topic compaction 覆盖 → 跳过
     //   - 不相关的话题/子话题 → 直接丢弃（不进 prompt）
     //   - 相关 + 有 LLM 摘要 → 用摘要
     //   - 相关 + 无摘要 → 用原始消息（tool result 用 cache 截断版本）
@@ -259,6 +318,14 @@ export class TurnIndexedContextEngine {
 
     for (let i = 0; i < recentCutoff; i++) {
       const turn = turns[i];
+
+      // 已被 topic compaction 或 subtopic compaction 覆盖的 turn → 跳过
+      if (topicCompactedIds.has(turn.topicId)) {
+        continue;
+      }
+      if (subtopicCompactedTurnIds.has(turn.id)) {
+        continue;
+      }
 
       // 话题相关性过滤：不相关的老旧 turn 直接丢弃
       if (this.config.topicAwareEnabled && allTopics.length > 1) {
@@ -408,9 +475,17 @@ export class TurnIndexedContextEngine {
         );
       }
 
-      // Step 2: 截断后仍超阈值 → 异步触发 LLM 压缩
+      // Step 2: 截断后仍超阈值 → 异步触发 turn-level LLM 压缩
       if (usedTokens - tokensSaved > thresholdTokens) {
         this.triggerAsyncCompaction(sessionFile);
+      }
+
+      // Step 3: 兜底 — turn-level 压缩完成后仍超阈值 → 触发 topic-level 压缩
+      // 场景：所有 turn 都属于同一个话题，turn 摘要累加仍超窗口
+      // 策略：对最早的若干 topic（从时间最早的开始）生成 topic 级别的合并摘要
+      const estimatedPostCompact = usedTokens - tokensSaved;
+      if (estimatedPostCompact > thresholdTokens) {
+        this.triggerAsyncTopicCompaction(sessionFile, turns, recentCutoff, topicCompactedIds);
       }
     }
 
@@ -514,6 +589,488 @@ export class TurnIndexedContextEngine {
       .finally(() => {
         this.pendingCompactions.delete(sessionFile);
       });
+  }
+
+  // ── Topic-Level 兜底压缩 ─────────────────────────────────────────
+
+  /**
+   * 异步触发 topic 级别的兜底压缩。
+   *
+   * 触发条件：经过 turn-level 压缩 + tool result 截断后，上下文仍超阈值。
+   * 场景：
+   *   - 所有 turn 属于同一话题，turn 摘要累加仍超窗口
+   *   - 多话题但同话题内 turn 数量很大
+   *
+   * 策略：将同一 topic 下的多个 turn summaries 合并为一个 topic summary。
+   * 优先压缩时间最早的 topic（距离当前上下文最远）。
+   */
+  private triggerAsyncTopicCompaction(
+    sessionFile: string,
+    turns: TurnIndex[],
+    recentCutoff: number,
+    alreadyCompactedTopicIds: Set<string>,
+  ): void {
+    if (this.pendingTopicCompactions.has(sessionFile)) return;
+
+    this.pendingTopicCompactions.add(sessionFile);
+    this.config.logger?.info(`[assemble] triggering async TOPIC compaction for ${sessionFile}`);
+
+    this.compactTopics(sessionFile, turns, recentCutoff, alreadyCompactedTopicIds)
+      .then((result) => {
+        this.config.logger?.info(
+          `[topic-compact] completed: ${result.compactedTopics} topics, ${result.tokensSaved} tokens saved, ${result.llmCalls} LLM calls`,
+        );
+      })
+      .catch((err) => {
+        this.config.logger?.error(
+          `[topic-compact] failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      })
+      .finally(() => {
+        this.pendingTopicCompactions.delete(sessionFile);
+      });
+  }
+
+  /**
+   * Topic 级别压缩实现。
+   *
+   * 流程：
+   *   1. 按 topicId 分组非保护区的 turn
+   *   2. 从时间最早的 topic 开始，将该 topic 下所有 turn 的 summaries 合并
+   *   3. 调用 LLM 生成一个 topic-level 概括摘要
+   *   4. 结果存入 topic compaction cache
+   *   5. 下次 assemble 时，该 topic 的所有 turn 被一条 topic summary 替代
+   *
+   * 与 turn-level compact 的关系：
+   *   - turn-level: 单个 turn → 单个 summary
+   *   - topic-level: 多个 turn summaries → 一个 topic summary
+   *   - topic-level 是 turn-level 的“二次压缩”
+   */
+  async compactTopics(
+    sessionFile: string,
+    turns: TurnIndex[],
+    recentCutoff: number,
+    alreadyCompactedTopicIds: Set<string>,
+  ): Promise<{
+    compactedTopics: number;
+    tokensSaved: number;
+    llmCalls: number;
+  }> {
+    const { query } = await this.getIndex(sessionFile);
+    const cache = await this.getTopicCompactionCache(sessionFile);
+    const summaryCache = await loadSummaryCache(sessionFile);
+
+    // 按 topicId 分组非保护区的 turn
+    const topicGroups = new Map<string, { turns: TurnIndex[]; label: string }>();
+    const currentTopicId = turns[turns.length - 1]?.topicId;
+
+    for (let i = 0; i < recentCutoff; i++) {
+      const turn = turns[i];
+      const topicId = turn.topicId || "__default__";
+
+      // 跳过已压缩的和当前话题
+      if (alreadyCompactedTopicIds.has(topicId)) continue;
+      if (topicId === currentTopicId) {
+        // 当前话题也可以压缩（当它非常长时），但保留最近的部分
+        // 这里先统计，后面决定是否压缩
+      }
+
+      const group = topicGroups.get(topicId);
+      if (group) {
+        group.turns.push(turn);
+      } else {
+        // 查找 topic label
+        const allTopics = query.getAllTopics ? query.getAllTopics() : [];
+        const topic = allTopics.find(t => t.id === topicId);
+        topicGroups.set(topicId, {
+          turns: [turn],
+          label: topic?.label || topicId,
+        });
+      }
+    }
+
+    // 按时间排序：从最早的 topic 开始压缩
+    const sortedTopics = [...topicGroups.entries()].sort((a, b) => {
+      const aStart = a[1].turns[0]?.sequence ?? 0;
+      const bStart = b[1].turns[0]?.sequence ?? 0;
+      return aStart - bStart;
+    });
+
+    let compactedTopics = 0;
+    let tokensSaved = 0;
+    let llmCalls = 0;
+    let cacheDirty = false;
+
+    // 计算当前 token 预算 — 确定需要压缩几个 topic
+    const tokenBudget = this.config.maxContextTokens - this.config.systemPromptReserve;
+    const targetTokens = tokenBudget * this.config.compactionThreshold * 0.8; // 目标压到 80% 阈值
+
+    let currentEstimatedTokens = 0;
+    // 估算当前各 topic group 的 token 贡献
+    for (const [, group] of sortedTopics) {
+      for (const turn of group.turns) {
+        const turnState = this.state.turnStates[turn.id];
+        if (turnState?.compacted && turnState.summaryTokens) {
+          currentEstimatedTokens += turnState.summaryTokens;
+        } else {
+          currentEstimatedTokens += turn.totalTokens;
+        }
+      }
+    }
+
+    for (const [topicId, group] of sortedTopics) {
+      // 已经压到目标以下，停止
+      if (currentEstimatedTokens <= targetTokens) break;
+
+      // 已有 topic compaction 的跳过
+      if (getTopicCompaction(cache, topicId)) continue;
+
+      // 当前话题的特殊处理：
+      // 如果所有 turn 都属于同一个 topic（即 currentTopicId），
+      // 则降级到子话题级别压缩，而不是跳过。
+      if (topicId === currentTopicId) {
+        if (topicGroups.size > 1) {
+          // 还有其他非当前 topic 可压缩，优先压缩它们
+          continue;
+        }
+        // 唯一的 topic 就是当前话题 → 子话题级压缩
+        const subtopicResult = await this.compactSubTopics(
+          sessionFile, topicId, group.turns, group.label, summaryCache, cache,
+        );
+        compactedTopics += subtopicResult.compactedSubTopics;
+        tokensSaved += subtopicResult.tokensSaved;
+        llmCalls += subtopicResult.llmCalls;
+        currentEstimatedTokens -= subtopicResult.tokensSaved;
+        if (subtopicResult.compactedSubTopics > 0) cacheDirty = true;
+        continue;
+      }
+
+      // Turn 数太少不值得做 topic 级压缩
+      if (group.turns.length < 2) continue;
+
+      // 收集该 topic 下所有 turn 的摘要/内容
+      const turnSummaries: string[] = [];
+      let topicOriginalTokens = 0;
+
+      for (const turn of group.turns) {
+        const turnState = this.state.turnStates[turn.id];
+        if (turnState?.compacted && turnState.summary) {
+          turnSummaries.push(`Turn #${turn.sequence}: ${turnState.summary}`);
+          topicOriginalTokens += turnState.summaryTokens ?? estimateTokens(turnState.summary);
+        } else {
+          // 没有 turn summary，用 preview
+          const cached = getCachedSummary(summaryCache, turn.id);
+          if (cached) {
+            turnSummaries.push(`Turn #${turn.sequence}: ${cached.summary}`);
+            topicOriginalTokens += cached.tokens;
+          } else {
+            turnSummaries.push(
+              `Turn #${turn.sequence}: User: ${turn.userPreview.slice(0, 100)} → Assistant: ${turn.assistantPreview.slice(0, 100)}`,
+            );
+            topicOriginalTokens += turn.totalTokens;
+          }
+        }
+      }
+
+      // 调用 LLM 生成 topic-level 摘要
+      const topicContent = turnSummaries.join("\n\n");
+      let topicSummary: string;
+      let method: "llm" | "local" = "local";
+
+      if (this.config.summarize) {
+        try {
+          this.config.logger?.info(
+            `[topic-compact] topic "${group.label}" (${group.turns.length} turns, ~${topicOriginalTokens} tokens): calling LLM`,
+          );
+          topicSummary = await this.config.summarize(
+            topicContent,
+            `Generate a concise topic-level summary for topic "${group.label}" containing ${group.turns.length} turns. ` +
+            `Capture key decisions, actions taken, and results. Be concise but preserve important details like file paths, error messages, and conclusions.`,
+          );
+          method = "llm";
+          llmCalls++;
+          this.config.logger?.info(
+            `[topic-compact] topic "${group.label}": LLM summary OK (${topicSummary.length} chars)`,
+          );
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          this.config.logger?.error(
+            `[topic-compact] topic "${group.label}": LLM failed: ${errMsg}, using local fallback`,
+          );
+          topicSummary = buildLocalTopicSummary(group.label, group.turns, this.state);
+        }
+      } else {
+        topicSummary = buildLocalTopicSummary(group.label, group.turns, this.state);
+      }
+
+      const summaryTokens = estimateTokens(topicSummary);
+
+      // 写入缓存
+      const entry: TopicCompactionEntry = {
+        topicId,
+        topicLabel: group.label,
+        summary: topicSummary,
+        summaryTokens,
+        turnCount: group.turns.length,
+        turnIds: group.turns.map(t => t.id),
+        originalTokens: topicOriginalTokens,
+        method,
+        createdAt: new Date().toISOString(),
+      };
+      setTopicCompaction(cache, entry);
+      cacheDirty = true;
+
+      // 更新估算
+      currentEstimatedTokens -= topicOriginalTokens;
+      currentEstimatedTokens += summaryTokens;
+      tokensSaved += topicOriginalTokens - summaryTokens;
+      compactedTopics++;
+
+      this.config.logger?.info(
+        `[topic-compact] topic "${group.label}": ${topicOriginalTokens} → ${summaryTokens} tokens (saved ${topicOriginalTokens - summaryTokens})`,
+      );
+    }
+
+    // 持久化
+    if (cacheDirty) {
+      await saveTopicCompactionCache(sessionFile, cache);
+      // 更新内存缓存
+      this.topicCompactionCacheMap.set(sessionFile, cache);
+    }
+
+    return { compactedTopics, tokensSaved, llmCalls };
+  }
+
+  // ── 子话题级压缩（同一大话题内的兜底）─────────────────────
+
+  /**
+   * 子话题级压缩：当所有 turn 都属于同一个大 topic 时的兜底策略。
+   *
+   * 场景：用户一直围绕同一个主题工作（如“插件开发”），但主题内有多个子任务：
+   *   - 子话题 1：“配置注册” (turns 0-5)
+   *   - 子话题 2：“调试 502 错误” (turns 6-8)
+   *   - 子话题 3：“开发 topic 分割” (turns 9-15) ← 当前
+   *
+   * 压缩策略：
+   *   - 当前子话题不压缩（保留细粒度）
+   *   - 从最早的子话题开始，将其下的多个 turn 合并为一个 subtopic summary
+   *   - 结果存入 topic compaction cache，以 "topicId:subtopicId" 为 key
+   */
+  private async compactSubTopics(
+    sessionFile: string,
+    topicId: string,
+    topicTurns: TurnIndex[],
+    topicLabel: string,
+    summaryCache: SummaryCache,
+    topicCache: TopicCompactionCache,
+  ): Promise<{
+    compactedSubTopics: number;
+    tokensSaved: number;
+    llmCalls: number;
+  }> {
+    // 加载子话题信息
+    await this.loadSubTopicCacheIfNeeded(sessionFile);
+    const subtopicResult = this.subtopicCache.get(topicId);
+
+    // 如果没有子话题信息，尝试用启发式检测生成
+    let subtopics: Array<{ id: string; label: string; turnSequences: number[]; isCurrent: boolean }>;
+    if (!subtopicResult || subtopicResult.subtopics.length <= 1) {
+      // 没有子话题分割信息，用启发式检测临时生成
+      const { detectSubTopicsByHeuristic } = await import("../topic/subtopic-detector.js");
+      const detected = detectSubTopicsByHeuristic(topicId, topicTurns);
+      subtopics = detected.subtopics;
+
+      if (subtopics.length <= 1) {
+        // 真的只有一个子话题，用时间切分法做最后兜底
+        this.config.logger?.info(
+          `[subtopic-compact] topic "${topicLabel}": only 1 subtopic detected, falling back to time-based chunking`,
+        );
+        subtopics = this.chunkTurnsByTime(topicTurns);
+      }
+    } else {
+      subtopics = subtopicResult.subtopics;
+    }
+
+    this.config.logger?.info(
+      `[subtopic-compact] topic "${topicLabel}": ${subtopics.length} subtopics, compacting from earliest`,
+    );
+
+    // 按时间排序（最早的子话题优先压缩）
+    const sortedSubtopics = [...subtopics].sort((a, b) => {
+      const aMin = Math.min(...a.turnSequences);
+      const bMin = Math.min(...b.turnSequences);
+      return aMin - bMin;
+    });
+
+    // 找到当前子话题（不压缩）
+    const currentSubtopic = sortedSubtopics.find(s => s.isCurrent);
+    const currentSubtopicId = currentSubtopic?.id;
+
+    const tokenBudget = this.config.maxContextTokens - this.config.systemPromptReserve;
+    const targetTokens = tokenBudget * this.config.compactionThreshold * 0.8;
+
+    let compactedSubTopics = 0;
+    let tokensSaved = 0;
+    let llmCalls = 0;
+
+    // turn sequence → TurnIndex 的映射
+    const turnBySequence = new Map<number, TurnIndex>();
+    for (const turn of topicTurns) {
+      turnBySequence.set(turn.sequence, turn);
+    }
+
+    // 估算当前总 token
+    let currentEstimatedTokens = 0;
+    for (const turn of topicTurns) {
+      const turnState = this.state.turnStates[turn.id];
+      if (turnState?.compacted && turnState.summaryTokens) {
+        currentEstimatedTokens += turnState.summaryTokens;
+      } else {
+        currentEstimatedTokens += turn.totalTokens;
+      }
+    }
+
+    for (const subtopic of sortedSubtopics) {
+      // 已压到目标以下，停止
+      if (currentEstimatedTokens <= targetTokens) break;
+
+      // 当前子话题不压缩
+      if (subtopic.id === currentSubtopicId) continue;
+
+      // 检查是否已压缩
+      const cacheKey = `${topicId}:${subtopic.id}`;
+      if (getTopicCompaction(topicCache, cacheKey)) continue;
+
+      // 收集该子话题下的 turn
+      const subTurns = subtopic.turnSequences
+        .map(seq => turnBySequence.get(seq))
+        .filter((t): t is TurnIndex => t !== undefined);
+
+      if (subTurns.length < 2) continue;
+
+      // 收集 turn summaries
+      const turnSummaries: string[] = [];
+      let subtopicOriginalTokens = 0;
+
+      for (const turn of subTurns) {
+        const turnState = this.state.turnStates[turn.id];
+        if (turnState?.compacted && turnState.summary) {
+          turnSummaries.push(`Turn #${turn.sequence}: ${turnState.summary}`);
+          subtopicOriginalTokens += turnState.summaryTokens ?? estimateTokens(turnState.summary);
+        } else {
+          const cached = getCachedSummary(summaryCache, turn.id);
+          if (cached) {
+            turnSummaries.push(`Turn #${turn.sequence}: ${cached.summary}`);
+            subtopicOriginalTokens += cached.tokens;
+          } else {
+            turnSummaries.push(
+              `Turn #${turn.sequence}: User: ${turn.userPreview.slice(0, 100)} → Assistant: ${turn.assistantPreview.slice(0, 100)}`,
+            );
+            subtopicOriginalTokens += turn.totalTokens;
+          }
+        }
+      }
+
+      // 调用 LLM 生成 subtopic-level 摘要
+      const content = turnSummaries.join("\n\n");
+      let summary: string;
+      let method: "llm" | "local" = "local";
+
+      if (this.config.summarize) {
+        try {
+          this.config.logger?.info(
+            `[subtopic-compact] subtopic "${subtopic.label}" (${subTurns.length} turns, ~${subtopicOriginalTokens} tokens): calling LLM`,
+          );
+          summary = await this.config.summarize(
+            content,
+            `Generate a concise summary for sub-topic "${subtopic.label}" within topic "${topicLabel}". ` +
+            `This sub-topic contains ${subTurns.length} turns. ` +
+            `Capture the key problem, actions taken, and resolution. Preserve file paths, commands, and error messages.`,
+          );
+          method = "llm";
+          llmCalls++;
+          this.config.logger?.info(
+            `[subtopic-compact] subtopic "${subtopic.label}": LLM summary OK (${summary.length} chars)`,
+          );
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          this.config.logger?.error(
+            `[subtopic-compact] subtopic "${subtopic.label}": LLM failed: ${errMsg}`,
+          );
+          summary = buildLocalTopicSummary(subtopic.label, subTurns, this.state);
+        }
+      } else {
+        summary = buildLocalTopicSummary(subtopic.label, subTurns, this.state);
+      }
+
+      const summaryTokens = estimateTokens(summary);
+
+      // 存入缓存，用 "topicId:subtopicId" 作为 key
+      const entry: TopicCompactionEntry = {
+        topicId: cacheKey,
+        topicLabel: `${topicLabel} > ${subtopic.label}`,
+        summary,
+        summaryTokens,
+        turnCount: subTurns.length,
+        turnIds: subTurns.map(t => t.id),
+        originalTokens: subtopicOriginalTokens,
+        method,
+        createdAt: new Date().toISOString(),
+      };
+      setTopicCompaction(topicCache, entry);
+
+      currentEstimatedTokens -= subtopicOriginalTokens;
+      currentEstimatedTokens += summaryTokens;
+      tokensSaved += subtopicOriginalTokens - summaryTokens;
+      compactedSubTopics++;
+
+      this.config.logger?.info(
+        `[subtopic-compact] "${subtopic.label}": ${subtopicOriginalTokens} → ${summaryTokens} tokens (saved ${subtopicOriginalTokens - summaryTokens})`,
+      );
+    }
+
+    // 持久化由调用方处理（compactTopics 中 cacheDirty=true 后 save）
+    if (compactedSubTopics > 0) {
+      await saveTopicCompactionCache(sessionFile, topicCache);
+      this.topicCompactionCacheMap.set(sessionFile, topicCache);
+    }
+
+    return { compactedSubTopics, tokensSaved, llmCalls };
+  }
+
+  /**
+   * 当启发式检测也无法分割子话题时，用固定 chunk 大小切分。
+   * 每 5 个 turn 为一组，最后一组标记为 isCurrent。
+   */
+  private chunkTurnsByTime(
+    turns: TurnIndex[],
+  ): Array<{ id: string; label: string; turnSequences: number[]; isCurrent: boolean }> {
+    const CHUNK_SIZE = 5;
+    const chunks: Array<{ id: string; label: string; turnSequences: number[]; isCurrent: boolean }> = [];
+
+    for (let i = 0; i < turns.length; i += CHUNK_SIZE) {
+      const chunk = turns.slice(i, i + CHUNK_SIZE);
+      const isLast = i + CHUNK_SIZE >= turns.length;
+      chunks.push({
+        id: `chunk-${Math.floor(i / CHUNK_SIZE)}`,
+        label: `Turns ${chunk[0].sequence}-${chunk[chunk.length - 1].sequence}`,
+        turnSequences: chunk.map(t => t.sequence),
+        isCurrent: isLast,
+      });
+    }
+
+    return chunks;
+  }
+
+  // ── Topic Compaction Cache 管理 ───────────────────────────────────
+
+  private async getTopicCompactionCache(sessionFile: string): Promise<TopicCompactionCache> {
+    const cached = this.topicCompactionCacheMap.get(sessionFile);
+    if (cached) return cached;
+
+    const loaded = await loadTopicCompactionCache(sessionFile);
+    this.topicCompactionCacheMap.set(sessionFile, loaded);
+    return loaded;
   }
 
   // ── compact：压缩旧 Turn，生成摘要 ───────────────────────────────────
@@ -1028,6 +1585,54 @@ function truncateHeadTailByTokens(text: string, maxTokens: number): string {
 }
 
 /**
+ * Topic 级别的本地摘要（LLM 不可用时的回退方案）。
+ * 将多个 turn 的信息合并为一个精炼的 topic 概述。
+ */
+function buildLocalTopicSummary(
+  topicLabel: string,
+  groupTurns: TurnIndex[],
+  state: EngineState,
+): string {
+  const parts: string[] = [];
+
+  parts.push(`## Topic: ${topicLabel} (${groupTurns.length} turns)`);
+  parts.push(``);
+
+  // 收集工具和要点
+  const allTools = new Set<string>();
+  const highlights: string[] = [];
+
+  for (const turn of groupTurns) {
+    for (const tool of turn.toolsUsed) allTools.add(tool);
+
+    const turnState = state.turnStates[turn.id];
+    if (turnState?.compacted && turnState.summary) {
+      // 取摘要的前 2 行
+      const lines = turnState.summary.split("\n").filter(l => l.trim());
+      highlights.push(lines.slice(0, 2).join("; "));
+    } else {
+      highlights.push(`User: ${turn.userPreview.slice(0, 80)} → ${turn.assistantPreview.slice(0, 60)}`);
+    }
+  }
+
+  if (allTools.size > 0) {
+    parts.push(`Tools used: ${[...allTools].join(", ")}`);
+  }
+
+  parts.push(``);
+  parts.push(`Key turns:`);
+  // 最多保留 8 个要点，避免本地摘要太长
+  for (const h of highlights.slice(0, 8)) {
+    parts.push(`  - ${h}`);
+  }
+  if (highlights.length > 8) {
+    parts.push(`  - ... and ${highlights.length - 8} more turns`);
+  }
+
+  return parts.join("\n");
+}
+
+/**
  * 本地提取式摘要：从 Turn 的原始消息中提取关键信息。
  * 不依赖 LLM，纯规则提取。
  */
@@ -1116,10 +1721,20 @@ function normalizeMessageContent(msg: EngineMessage): EngineMessage {
   if (typeof msg.content === "string") {
     return { ...msg, content: [{ type: "text", text: msg.content }] };
   }
-  if (!msg.content) {
-    return { ...msg, content: [{ type: "text", text: "" }] };
+  if (!msg.content || !Array.isArray(msg.content)) {
+    return { ...msg, content: [{ type: "text", text: String(msg.content ?? "") }] };
   }
-  return msg;
+  // Ensure each element in the array is a valid object (not raw string)
+  const normalized = (msg.content as unknown[]).map((part) => {
+    if (typeof part === "string") {
+      return { type: "text" as const, text: part };
+    }
+    if (!part || typeof part !== "object") {
+      return { type: "text" as const, text: String(part ?? "") };
+    }
+    return part as { type: string; text?: string; [key: string]: unknown };
+  });
+  return { ...msg, content: normalized };
 }
 
 function extractText(content: unknown): string {

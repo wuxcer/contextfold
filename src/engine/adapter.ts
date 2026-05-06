@@ -27,17 +27,36 @@ export interface AdapterOptions {
 
 /**
  * Ensure message content is always an array (OpenClaw runtime expects ContentPart[]).
- * Handles string, null, undefined, and already-array cases.
+ * Handles string, null, undefined, number, object, and already-array cases.
+ * Must never return content as anything other than an array.
  */
 function ensureArrayContent(msg: any): any {
   if (!msg) return msg;
-  if (typeof msg.content === "string") {
-    return { ...msg, content: [{ type: "text", text: msg.content }] };
+
+  const content = msg.content;
+
+  // Already an array — verify elements are valid ContentPart objects
+  if (Array.isArray(content)) {
+    // Ensure each element is an object (not a raw string/number)
+    const normalized = content.map((part: any) => {
+      if (typeof part === "string") {
+        return { type: "text", text: part };
+      }
+      if (!part || typeof part !== "object") {
+        return { type: "text", text: String(part ?? "") };
+      }
+      return part;
+    });
+    return { ...msg, content: normalized };
   }
-  if (!msg.content || !Array.isArray(msg.content)) {
-    return { ...msg, content: [{ type: "text", text: "" }] };
+
+  // String content → wrap
+  if (typeof content === "string") {
+    return { ...msg, content: [{ type: "text", text: content }] };
   }
-  return msg;
+
+  // Null, undefined, or any other type → empty text part
+  return { ...msg, content: [{ type: "text", text: String(content ?? "") }] };
 }
 
 export function createContextEngineAdapter(
